@@ -26,6 +26,9 @@ pub struct TinyCompactMap<T> {
     bitmap: u64,
     elts: *mut T,
 }
+/// Type of keys in a `TinyCompactMap`, which are always small
+/// integers.
+pub type Key = u8;
 
 impl<T> fmt::Debug for TinyCompactMap<T>
     where T: fmt::Debug
@@ -46,25 +49,25 @@ impl<T> TinyCompactMap<T> {
         TinyCompactMap { bitmap: 0, elts: ptr::null_mut() }
     }
 
-    fn index_of(&self, key: u8) -> Option<isize> {
+    fn index_of(&self, key: Key) -> Option<isize> {
         assert!(key < 64);
         if 0 == self.bitmap & 1<<key { return None }
         Some((self.bitmap & ((1<<key)-1)).count_ones() as isize)
     }
 
     /// Gets a mutable reference to the value associated with `key`.
-    pub fn get_mut(&self, key: u8) -> Option<&mut T> {
+    pub fn get_mut(&self, key: Key) -> Option<&mut T> {
         unsafe { self.index_of(key).and_then(|idx| self.elts.offset(idx).as_mut()) }
     }
 
     /// Gets a reference to the value associated with `key`.
-    pub fn get(&self, key: u8) -> Option<&T> {
+    pub fn get(&self, key: Key) -> Option<&T> {
         unsafe { self.index_of(key).and_then(|idx| self.elts.offset(idx).as_ref()) }
     }
 
     /// Associates `value` with `key`, returning the old value if one
     /// existed.
-    pub fn insert(&mut self, key: u8, value: T) -> Option<T> {
+    pub fn insert(&mut self, key: Key, value: T) -> Option<T> {
         assert!(key < 64);
         let t_size = mem::size_of::<T>();
         if let Some(slot) = self.get_mut(key) {
@@ -93,6 +96,14 @@ impl<T> TinyCompactMap<T> {
         };
         None
     }
+
+    /// Creates an iterator over this map.
+    pub fn iter(&self) -> Iter<T> {
+        Iter {
+            map: self,
+            idx: 0,
+        }
+    }
 }
 
 impl<T> Drop for TinyCompactMap<T> {
@@ -107,9 +118,27 @@ impl<T> Drop for TinyCompactMap<T> {
     }
 }
 
+/// Iterator over a tiny compact map.
+pub struct Iter<'a, T: 'a> {
+    map: &'a TinyCompactMap<T>,
+    idx: Key,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = (Key, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx > 63 { return None }
+        let next = (self.map.bitmap & !((1<<self.idx)-1)).trailing_zeros() as u8;
+        if next >= 64 { return None }
+        self.idx = 1 + next;
+        self.map.get(next).map(|v| (next, v))
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::TinyCompactMap;
+    use super::{TinyCompactMap, Key};
     use quickcheck::TestResult;
     use std::collections::BTreeMap;
 
@@ -130,9 +159,17 @@ mod test {
         assert!(canary);
     }
 
+    #[test]
+    fn full_occupancy() {
+        let mut m = TinyCompactMap::new();
+        for i in 0..64 { m.insert(i,i); }
+        assert!(m.iter().all(|(k,&v)| k == v))
+    }
+
+
     quickcheck! {
-        fn insert_and_query(v: Vec<(u8,u64)>) -> TestResult {
-            let v = v.iter().cloned().filter(|&(i,_f)| i <= 63).collect::<Vec<(u8,u64)>>();
+        fn insert_and_query(v: Vec<(Key,u64)>) -> TestResult {
+            let v = v.iter().cloned().filter(|&(i,_f)| i <= 63).collect::<Vec<(Key,u64)>>();
             let mut cv = TinyCompactMap::new();
             let mut tree = BTreeMap::new();
             for &(i,f) in v.iter() {
@@ -144,8 +181,8 @@ mod test {
             TestResult::passed()
         }
 
-        fn double_insert_gives_orig(v: Vec<(u8,u64)>) -> TestResult {
-            let v = v.iter().cloned().filter(|&(i,_f)| i <= 63).collect::<Vec<(u8,u64)>>();
+        fn double_insert_gives_orig(v: Vec<(Key,u64)>) -> TestResult {
+            let v = v.iter().cloned().filter(|&(i,_f)| i <= 63).collect::<Vec<(Key,u64)>>();
             let mut cv = TinyCompactMap::new();
             let mut tree = BTreeMap::new();
             for &(i,f) in v.iter() {
@@ -156,5 +193,16 @@ mod test {
             }
             TestResult::passed()
         }
+
+        fn insert_and_query_iter(v: Vec<(Key,u64)>) -> bool {
+            let v = v.iter().cloned().filter(|&(i,_f)| i <= 63).collect::<Vec<(Key,u64)>>();
+            let mut cv = TinyCompactMap::new();
+            let mut tree = BTreeMap::new();
+            for &(i,f) in v.iter() {
+                assert_eq!(tree.insert(i, f), cv.insert(i, f));
+            }
+            cv.iter().zip(tree.iter()).all(|(a,(&bk,bv))| a == (bk,bv))
+        }
+
     }
 }
