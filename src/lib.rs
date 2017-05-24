@@ -18,7 +18,7 @@ extern crate quickcheck;
 extern crate alloc;
 
 use alloc::heap;
-use std::{fmt, mem, ptr};
+use std::{fmt, mem, ptr, u64};
 
 /// Compact map of up to 64 elements, where the keys are small integers
 /// and the values are `T`.
@@ -101,7 +101,8 @@ impl<T> TinyCompactMap<T> {
     pub fn iter(&self) -> Iter<T> {
         Iter {
             map: self,
-            idx: 0,
+            front: 0,
+            back: 0,
         }
     }
 }
@@ -121,17 +122,31 @@ impl<T> Drop for TinyCompactMap<T> {
 /// Iterator over a tiny compact map.
 pub struct Iter<'a, T: 'a> {
     map: &'a TinyCompactMap<T>,
-    idx: Key,
+    front: Key,
+    back: Key,
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = (Key, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.idx > 63 { return None }
-        let next = (self.map.bitmap & !((1<<self.idx)-1)).trailing_zeros() as u8;
-        if next >= 64 { return None }
-        self.idx = 1 + next;
+        if self.front + self.back >= 64 { return None }
+        let masked = self.map.bitmap & !((1<<self.front)-1);
+        if masked == 0 { return None }
+        let next = masked.trailing_zeros() as u8;
+        self.front = 1 + next;
+        self.map.get(next).map(|v| (next, v))
+    }
+}
+
+impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front + self.back >= 64 { return None }
+        let masked = self.map.bitmap & (u64::MAX>>self.back);
+        if masked == 0 { return None }
+        let lz = masked.leading_zeros() as u8;
+        self.back = 1 + lz;
+        let next = 63 - lz;
         self.map.get(next).map(|v| (next, v))
     }
 }
@@ -163,7 +178,25 @@ mod test {
     fn full_occupancy() {
         let mut m = TinyCompactMap::new();
         for i in 0..64 { m.insert(i,i); }
-        assert!(m.iter().all(|(k,&v)| k == v))
+        assert!(m.iter().all(|(k,&v)| k == v));
+    }
+
+    #[test]
+    fn reverse_iterator_full_occupancy() {
+        let mut m = TinyCompactMap::new();
+        let mut v = (0..64).collect::<Vec<_>>();
+        for &i in v.iter() { m.insert(i,i); }
+        v.reverse();
+        assert_eq!(v, m.iter().rev().map(|(_k,&v)| v).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reverse_iterator() {
+        let mut m = TinyCompactMap::new();
+        let mut u = vec![(1,42),(10,23),(45,17)];
+        for &(k,v) in u.iter() { m.insert(k,v); }
+        u.reverse();
+        assert_eq!(u, m.iter().rev().map(|(k,&v)| (k,v)).collect::<Vec<_>>());
     }
 
 
