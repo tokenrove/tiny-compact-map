@@ -30,6 +30,11 @@ pub struct TinyCompactMap<T> {
 /// integers.
 pub type Key = u8;
 
+#[cfg(target_arch="x86_64")]
+unsafe impl<T> Send for TinyCompactMap<T> {}
+#[cfg(target_arch="x86_64")]
+unsafe impl<T> Sync for TinyCompactMap<T> {}
+
 impl<T> fmt::Debug for TinyCompactMap<T>
     where T: fmt::Debug
 {
