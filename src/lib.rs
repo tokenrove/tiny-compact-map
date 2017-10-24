@@ -167,22 +167,23 @@ mod test {
     use super::{TinyCompactMap, Key};
     use quickcheck::TestResult;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(PartialEq,Debug)]
-    struct ExplicitDrop<'a>(&'a mut bool);
+    #[derive(Debug)]
+    struct ExplicitDrop<'a>(&'a AtomicUsize);
 
     impl<'a> Drop for ExplicitDrop<'a> {
-        fn drop(&mut self) { *self.0 = true; }
+        fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
     }
 
     #[test]
     fn explicit_drop_test() {
-        let mut canary = false;
+        let canary = AtomicUsize::new(0);
         {
             let mut t = TinyCompactMap::new();
-            assert_eq!(None, t.insert(42, ExplicitDrop(&mut canary)));
+            assert!(t.insert(42, ExplicitDrop(&canary)).is_none());
         }
-        assert!(canary);
+        assert_eq!(1, canary.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -248,5 +249,14 @@ mod test {
             cv.iter().zip(tree.iter()).all(|(a,(&bk,bv))| a == (bk,bv))
         }
 
+        fn many_droppables(n: usize) -> bool {
+            let canary = AtomicUsize::new(0);
+            let n = ::std::cmp::min(n, 64);
+            {
+                let mut t = TinyCompactMap::new();
+                for i in 0..n { t.insert(i as u8, ExplicitDrop(&canary)); }
+            }
+            n == canary.load(Ordering::Relaxed)
+        }
     }
 }
