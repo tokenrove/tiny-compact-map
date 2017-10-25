@@ -9,22 +9,21 @@
     variant_size_differences,
 )]
 
-#![feature(alloc, heap_api)]
+#![feature(allocator_api)]
+#![feature(unique)]
 
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
 
-extern crate alloc;
-
-use alloc::heap;
+use std::heap::{Alloc, Heap};
 use std::{fmt, mem, ptr, u64};
 
 /// Compact map of up to 64 elements, where the keys are small integers
 /// and the values are `T`.
 pub struct TinyCompactMap<T> {
     bitmap: u64,
-    elts: *mut T,
+    elts: Option<ptr::Unique<T>>,
 }
 /// Type of keys in a `TinyCompactMap`, which are always small
 /// integers.
@@ -35,10 +34,14 @@ impl<T> fmt::Debug for TinyCompactMap<T>
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "TinyCompactMap {{ bitmap: {:b}, elts: ", self.bitmap)?;
-        f.debug_list()
-            .entries((0..self.bitmap.count_ones())
-                     .map(|i| unsafe { self.elts.offset(1+i as isize) }))
-            .finish()?;
+        {
+            let mut list = f.debug_list();
+            if let Some(p) = self.elts {
+                list.entries((0..self.bitmap.count_ones())
+                             .map(|i| unsafe { p.as_ptr().offset(1+i as isize) }));
+            }
+            list.finish()?;
+        }
         write!(f, "}}")
     }
 }
@@ -46,7 +49,7 @@ impl<T> fmt::Debug for TinyCompactMap<T>
 impl<T> TinyCompactMap<T> {
     /// Creates an empty map.
     pub fn new() -> Self {
-        TinyCompactMap { bitmap: 0, elts: ptr::null_mut() }
+        TinyCompactMap { bitmap: 0, elts: None }
     }
 
     fn index_of(&self, key: Key) -> Option<isize> {
@@ -57,42 +60,48 @@ impl<T> TinyCompactMap<T> {
 
     /// Gets a mutable reference to the value associated with `key`.
     pub fn get_mut(&self, key: Key) -> Option<&mut T> {
-        unsafe { self.index_of(key).and_then(|idx| self.elts.offset(idx).as_mut()) }
+        unsafe {
+            self.index_of(key).and_then(|idx| self.elts.and_then({
+                |p| p.as_ptr().offset(idx).as_mut()
+            }))
+        }
     }
 
     /// Gets a reference to the value associated with `key`.
     pub fn get(&self, key: Key) -> Option<&T> {
-        unsafe { self.index_of(key).and_then(|idx| self.elts.offset(idx).as_ref()) }
+        unsafe {
+            self.index_of(key).and_then(|idx| self.elts.and_then({
+                |p| p.as_ptr().offset(idx).as_ref()
+            }))
+        }
     }
 
     /// Associates `value` with `key`, returning the old value if one
     /// existed.
+    ///
+    /// Panics on memory allocation failure.
     pub fn insert(&mut self, key: Key, value: T) -> Option<T> {
         assert!(key < 64);
-        let t_size = mem::size_of::<T>();
         if let Some(slot) = self.get_mut(key) {
             return Some(mem::replace(slot, value))
         }
         let count = self.bitmap.count_ones() as usize;
-        let old_size = t_size * count;
-        let new_size = old_size + t_size;
         let new = unsafe {
-            if self.bitmap == 0 {
-                assert!(self.elts.is_null());
-                heap::allocate(new_size, mem::align_of::<T>())
+            if let Some(p) = self.elts {
+                Heap.realloc_array(p, count, 1+count).unwrap()
             } else {
-                heap::reallocate(self.elts as *mut u8, old_size, new_size, mem::align_of::<T>())
+                assert_eq!(0, self.bitmap);
+                Heap.alloc_array(1+count).unwrap()
             }
         };
-        assert!(!new.is_null());
-        self.elts = new as *mut T;
+        self.elts = Some(new);
         self.bitmap |= 1<<key;
         let idx = (self.bitmap & ((1<<key) - 1)).count_ones() as isize;
         unsafe {
-            ptr::copy(self.elts.offset(idx),
-                      self.elts.offset(1+idx),
+            ptr::copy(new.as_ptr().offset(idx),
+                      new.as_ptr().offset(1+idx),
                       count - idx as usize);
-            ptr::write(self.elts.offset(idx), value)
+            ptr::write(new.as_ptr().offset(idx), value)
         };
         None
     }
@@ -109,12 +118,14 @@ impl<T> TinyCompactMap<T> {
 
 impl<T> Drop for TinyCompactMap<T> {
     fn drop(&mut self) {
-        if self.bitmap == 0 { return }
-        let count = self.bitmap.count_ones() as usize;
-        unsafe {
-            let size = count * mem::size_of::<T>();
-            for i in 0..count { ptr::drop_in_place(self.elts.offset(i as isize)); }
-            heap::deallocate(self.elts as *mut u8, size, mem::align_of::<T>());
+        if let Some(p) = self.elts {
+            let count = self.bitmap.count_ones() as usize;
+            unsafe {
+                for i in 0..count {
+                    ptr::drop_in_place(p.as_ptr().offset(i as isize));
+                }
+                Heap.dealloc_array(p, count).unwrap();
+            }
         }
     }
 }
@@ -156,22 +167,23 @@ mod test {
     use super::{TinyCompactMap, Key};
     use quickcheck::TestResult;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(PartialEq,Debug)]
-    struct ExplicitDrop<'a>(&'a mut bool);
+    #[derive(Debug)]
+    struct ExplicitDrop<'a>(&'a AtomicUsize);
 
     impl<'a> Drop for ExplicitDrop<'a> {
-        fn drop(&mut self) { *self.0 = true; }
+        fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
     }
 
     #[test]
     fn explicit_drop_test() {
-        let mut canary = false;
+        let canary = AtomicUsize::new(0);
         {
             let mut t = TinyCompactMap::new();
-            assert_eq!(None, t.insert(42, ExplicitDrop(&mut canary)));
+            assert!(t.insert(42, ExplicitDrop(&canary)).is_none());
         }
-        assert!(canary);
+        assert_eq!(1, canary.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -237,5 +249,14 @@ mod test {
             cv.iter().zip(tree.iter()).all(|(a,(&bk,bv))| a == (bk,bv))
         }
 
+        fn many_droppables(n: usize) -> bool {
+            let canary = AtomicUsize::new(0);
+            let n = ::std::cmp::min(n, 64);
+            {
+                let mut t = TinyCompactMap::new();
+                for i in 0..n { t.insert(i as u8, ExplicitDrop(&canary)); }
+            }
+            n == canary.load(Ordering::Relaxed)
+        }
     }
 }
